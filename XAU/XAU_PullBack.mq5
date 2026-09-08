@@ -917,8 +917,8 @@ double ML_PredictWinProbability(int signal_type)
    
    features[0]  = (float)((cur_close - ema_value[1]) / cur_atr);                      // dist_to_ema_atr
    features[1]  = (float)adx_value[1];                                                // adx_main
-   features[2]  = (float)adx_pdi[1];                                                  // adx_pdi
-   features[3]  = (float)adx_mdi[1];                                                  // adx_mdi
+   features[2]  = (float)adx_plus_di[1];                                              // adx_pdi
+   features[3]  = (float)adx_minus_di[1];                                             // adx_mdi
    features[4]  = (float)(adx_plus_di[1] - adx_minus_di[1]);                          // adx_di_diff
    features[5]  = (float)rsi_value[1];                                                // rsi
    features[6]  = (float)(cur_atr / cur_close * 1000.0);                              // atr_normalized
