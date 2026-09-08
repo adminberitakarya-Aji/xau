@@ -1,14 +1,14 @@
 //+------------------------------------------------------------------+
-//|                                                  XAU_Phase1.mq5 |
-//|                 Expert Advisor XAUUSD | Fase 1 & 2 - ML ONNX     |
+//|                                                 XAU_PullBack.mq5 |
+//|          Expert Advisor XAUUSD | PullBack Discount Engine - ML ONNX |
 //|   EMA + ADX + RSI + Confirmed Candle + ONNX Filter + Dashboard   |
-//|   + Dynamic Martingale Recovery Engine                           |
+//|   + Dynamic Retest State Machine + Martingale Recovery Engine    |
 //+------------------------------------------------------------------+
-#property copyright   "XAU Phase1 & Phase2"
+#property copyright   "XAU PullBack Engine"
 #property link        ""
-#property version     "2.14"
+#property version     "2.15"
 #property strict
-#property description "EA XAUUSD: EMA + ADX + RSI + Confirmed Candle + ONNX ML + Dashboard + Martingale + Step-Lock Trailing (Single & Basket USD)"
+#property description "EA XAUUSD PULLBACK: Trend/Reversal Signal + 2M Retest Discount State Machine + ONNX ML + Dashboard + Martingale Recovery"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -16,8 +16,8 @@
 #include <Trade\DealInfo.mqh>
 #include <Trade\HistoryOrderInfo.mqh>
 
-//--- Resource model ONNX (tertanam langsung ke dalam file .ex5)
-#resource "model_xau.onnx" as uchar ExtModelONNX[]
+//--- Resource model ONNX khusus Pullback (tertanam langsung ke dalam file .ex5)
+#resource "model_xau_pullback.onnx" as uchar ExtModelONNX[]
 
 //+------------------------------------------------------------------+
 //| ENUM types                                                       |
@@ -63,11 +63,36 @@ enum ENUM_MARTI_DIST_MODE
    MARTI_DIST_FIXED  // 1: Fixed Jarak (poin)
   };
 
+enum ENUM_PULLBACK_DIST_MODE
+  {
+   PULLBACK_DIST_ATR,   // 0: Dinamis berbasis ATR
+   PULLBACK_DIST_FIXED  // 1: Fixed Jarak (poin)
+  };
+
+enum ENUM_PULLBACK_STATE
+  {
+   PB_STATE_IDLE,         // Tidak ada sinyal pending
+   PB_STATE_PENDING_BUY,  // Sinyal BUY terdeteksi, menunggu retest/koreksi turun ke zona diskon
+   PB_STATE_PENDING_SELL  // Sinyal SELL terdeteksi, menunggu retest/koreksi naik ke zona diskon
+  };
+
 //===================================================================
 //=== INPUT GROUP: SYMBOL & BROKER SETTINGS                        ===
 //===================================================================
 sinput group "===== SYMBOL & BROKER SETTINGS ====="
 input string             InpCustomSymbol = "";             // Custom Symbol (kosongkan = otomatis chart, misal XAUUSD.vx)
+
+//===================================================================
+//=== INPUT GROUP: PULLBACK & RETEST DISCOUNT ENGINE               ===
+//===================================================================
+sinput group "===== PULLBACK / DISCOUNT RETEST ENGINE ====="
+input bool                     InpUsePullback        = true;              // Aktifkan Eksekusi Tunggu Pullback / Retest
+input int                      InpPullbackTimeoutSec = 120;               // Waktu Tunggu Koreksi (detik; default 120s = 2 menit)
+input ENUM_PULLBACK_DIST_MODE  InpPullbackDistMode   = PULLBACK_DIST_ATR; // Mode Jarak Diskon Koreksi
+input double                   InpPullbackATR_Mult   = 0.20;              // Multiplier ATR untuk Diskon (jika Mode ATR, misal 0.2x ATR)
+input double                   InpPullbackFixedPts   = 50.0;              // Jarak Poin Diskon (jika Mode Fixed, misal 50 poin = $0.50)
+input double                   InpCancelATR_Mult     = 0.25;              // Batas Batal jika Lari Duluan (ATR Mult, misal 0.25x ATR)
+input double                   InpCancelFixedPts     = 60.0;              // Batas Batal jika Lari Duluan (Poin Fixed, misal 60 poin)
 
 //===================================================================
 //=== INPUT GROUP: INDIKATOR DASAR                                 ===
@@ -98,14 +123,14 @@ input bool               InpIsSellAllowed = true;          // Izinkan SELL
 input bool               InpUsePinBar     = true;          // Pin bar terkonfirmasi (Bar 1) utk reversal
 input bool               InpUseEngulfing  = true;          // Engulfing terkonfirmasi (Bar 1-2) utk reversal
 input int                InpMaxOpenPositions = 1;          // Max posisi terbuka
-input int                InpMagicNumber   = 20260824;      // Magic number
+input int                InpMagicNumber   = 20260901;      // Magic number (PullBack Engine)
 
 //===================================================================
-//=== INPUT GROUP: MACHINE LEARNING / ONNX (FASE 2)                ===
+//=== INPUT GROUP: MACHINE LEARNING / ONNX PULLBACK                ===
 //===================================================================
-sinput group "===== MACHINE LEARNING / ONNX (FASE 2) ====="
+sinput group "===== MACHINE LEARNING / ONNX PULLBACK ====="
 input bool               InpUseMLFilter   = true;          // Aktifkan Filter Machine Learning (Node 3)
-input double             InpMLMinWinProb  = 0.35;          // Min Win Probability agar order dieksekusi (0.35 - 0.65)
+input double             InpMLMinWinProb  = 0.35;          // Min Win Probability agar order dieksekusi (0.20 - 0.50)
 
 //===================================================================
 //=== INPUT GROUP: MONEY MANAGEMENT & MARTINGALE                   ===
@@ -187,7 +212,7 @@ int      handle_ATR_Fast = INVALID_HANDLE; // ATR Cepat untuk Volatility Regime 
 
 // ONNX Model handle
 long     handle_onnx     = INVALID_HANDLE;
-int      onnx_feature_count = 13; // Otomatis mendeteksi model 13 fitur lama atau 19 fitur baru
+int      onnx_feature_count = 19; // Default 19 fitur untuk model Pullback
 double   last_ml_prob    = 0.0;
 string   last_signal_desc = "Belum Ada Sinyal";
 
@@ -211,6 +236,13 @@ datetime last_bar_time = 0;
 // Basket Trailing Profit tracking
 double   basket_max_profit      = 0.0;
 bool     basket_trailing_active = false;
+
+// Pullback State Machine Variables
+ENUM_PULLBACK_STATE pb_state        = PB_STATE_IDLE;
+datetime            pb_signal_time  = 0;
+double              pb_ref_price    = 0.0;
+double              pb_target_price = 0.0;
+double              pb_cancel_price = 0.0;
 
 // Trade objects
 CTrade         trade;
@@ -426,6 +458,33 @@ void UpdateDashboard()
       rsi_val_str = "--";
      }
    
+   // Pullback status text
+   string pb_status_desc;
+   if(!InpUsePullback)
+     {
+      pb_status_desc = "NONAKTIF (Instant Entry di Open Bar)";
+     }
+   else if(pb_state == PB_STATE_IDLE)
+     {
+      pb_status_desc = "IDLE (Siap Menunggu Sinyal Bar Baru)";
+     }
+   else if(pb_state == PB_STATE_PENDING_BUY)
+     {
+      int elapsed = (int)(TimeCurrent() - pb_signal_time);
+      int remain  = MathMax(0, InpPullbackTimeoutSec - elapsed);
+      pb_status_desc = "WAITING BUY RETEST | Diskon Target <= " + DoubleToString(pb_target_price, trade_digits) +
+                       " | Batal jika >= " + DoubleToString(pb_cancel_price, trade_digits) +
+                       " | Sisa: " + IntegerToString(remain) + "s";
+     }
+   else if(pb_state == PB_STATE_PENDING_SELL)
+     {
+      int elapsed = (int)(TimeCurrent() - pb_signal_time);
+      int remain  = MathMax(0, InpPullbackTimeoutSec - elapsed);
+      pb_status_desc = "WAITING SELL RETEST | Diskon Target >= " + DoubleToString(pb_target_price, trade_digits) +
+                       " | Batal jika <= " + DoubleToString(pb_cancel_price, trade_digits) +
+                       " | Sisa: " + IntegerToString(remain) + "s";
+     }
+
    string martin_status;
    int marti_level = GetMartingaleLevel();
    string marti_dist_desc;
@@ -517,13 +576,19 @@ void UpdateDashboard()
 
    string text = "";
    text += "====================================================\n";
-   text += "[XAU AI ENGINE v2.14 ONNX ML]\n";
+   text += "[XAU PULLBACK DISCOUNT ENGINE v2.15 ONNX ML]\n";
    text += "====================================================\n";
-   text += "- Status EA           : RUNNING [AKTIF]\n";
+   text += "- Status EA           : RUNNING [AKTIF - PULLBACK MODE]\n";
+   text += "- Magic Number        : " + IntegerToString(InpMagicNumber) + "\n";
    text += "- Pair / Timeframe    : " + trade_symbol + " | " + EnumToString(_Period) + "\n";
    text += "- Spread Saat Ini     : " + IntegerToString(spread) + " Poin\n";
    text += "- Target SL / TP      : SL [" + sl_desc + "] | TP [" + tp_desc + "]\n";
    text += "- Jam Server          : " + TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS) + "\n";
+   text += "----------------------------------------------------\n";
+   text += "[PULLBACK / RETEST DISCOUNT STATE]\n";
+   text += "- Retest Mode         : " + (InpPullbackDistMode == PULLBACK_DIST_ATR ? ("ATR x" + DoubleToString(InpPullbackATR_Mult, 2)) : (DoubleToString(InpPullbackFixedPts, 0) + " pts")) +
+           " | Timeout: " + IntegerToString(InpPullbackTimeoutSec) + "s (2 Menit)\n";
+   text += "- Status Pullback     : " + pb_status_desc + "\n";
    text += "----------------------------------------------------\n";
    text += "[STATUS INDIKATOR & PASAR]\n";
    text += "- EMA (" + IntegerToString(InpEMA_Period) + ") Trend    : " + ema_trend + "\n";
@@ -532,7 +597,7 @@ void UpdateDashboard()
    text += "- RSI (" + IntegerToString(InpRSI_Period) + ") Value    : " + rsi_val_str + "\n";
    text += "- Monthly H/L (Prev)  : High=" + DoubleToString(monthly_high, trade_digits) + " | Low=" + DoubleToString(monthly_low, trade_digits) + "\n";
    text += "----------------------------------------------------\n";
-   text += "[MACHINE LEARNING - ONNX NODE 3]\n";
+   text += "[MACHINE LEARNING - ONNX PULLBACK]\n";
    text += "- Filter ML ONNX      : " + ml_status + "\n";
    text += "- Sinyal Terakhir     : " + last_signal_desc + "\n";
    text += "----------------------------------------------------\n";
@@ -569,7 +634,7 @@ int OnInit()
      }
    if(!sym_ok)
      {
-      Alert("[XAU EA] Gagal memilih simbol: ", trade_symbol, ". Pastikan pair ada di Market Watch!");
+      Alert("[XAU PULLBACK EA] Gagal memilih simbol: ", trade_symbol, ". Pastikan pair ada di Market Watch!");
       Print("OnInit FAILED: Simbol '", trade_symbol, "' tidak ditemukan di Market Watch.");
       return(INIT_FAILED);
      }
@@ -588,7 +653,7 @@ int OnInit()
    if(handle_EMA==INVALID_HANDLE || handle_EMA_H1==INVALID_HANDLE || handle_ADX==INVALID_HANDLE ||
       handle_RSI==INVALID_HANDLE || handle_ATR==INVALID_HANDLE || handle_ATR_Fast==INVALID_HANDLE)
      {
-      Alert("[XAU EA] Gagal buat handle indikator untuk pair: ", trade_symbol);
+      Alert("[XAU PULLBACK EA] Gagal buat handle indikator untuk pair: ", trade_symbol);
       Print("OnInit FAILED: Handle indikator invalid untuk pair '", trade_symbol, "'");
       return(INIT_FAILED);
      }
@@ -603,8 +668,7 @@ int OnInit()
    ArraySetAsSeries(atr_value, true);
    ArraySetAsSeries(atr_fast_value, true);
    
-   //--- Inisialisasi model ONNX (Fase 2)
-   //    Jika gagal, EA tetap BERJALAN dalam mode rule-based (ONNX bypass)
+   //--- Inisialisasi model ONNX Pullback
    if(InpUseMLFilter)
      {
       //--- 1. Coba load langsung dari buffer tersemat di dalam file .ex5 (#resource)
@@ -612,27 +676,29 @@ int OnInit()
         {
          handle_onnx = OnnxCreateFromBuffer(ExtModelONNX, ONNX_DEFAULT);
          if(handle_onnx != INVALID_HANDLE)
-            Print("OnInit: Model ONNX berhasil dimuat langsung dari resource biner tersemat (Embedded .ex5).");
+            Print("OnInit: Model ONNX Pullback berhasil dimuat langsung dari resource biner tersemat (Embedded .ex5).");
         }
       
       //--- 2. Fallback: coba load dari file fisik disk MQL5/Files/
       if(handle_onnx == INVALID_HANDLE)
-         handle_onnx = OnnxCreate("model_xau.onnx", ONNX_DEFAULT);
+         handle_onnx = OnnxCreate("model_xau_pullback.onnx", ONNX_DEFAULT);
       
       //--- 3. Fallback: coba dari subfolder Experts
       if(handle_onnx == INVALID_HANDLE)
-         handle_onnx = OnnxCreate("Experts\\model_xau.onnx", ONNX_DEFAULT);
+         handle_onnx = OnnxCreate("Experts\\model_xau_pullback.onnx", ONNX_DEFAULT);
+      
+      //--- 4. Fallback legacy model_xau.onnx jika pullback belum terkompilasi
+      if(handle_onnx == INVALID_HANDLE)
+         handle_onnx = OnnxCreate("model_xau.onnx", ONNX_DEFAULT);
       
       if(handle_onnx == INVALID_HANDLE)
         {
-         //--- EA tetap berjalan tapi ML dinonaktifkan otomatis
          last_signal_desc = "⚠️ ONNX gagal load! EA jalan tanpa filter ML";
-         Print("[XAU EA] Peringatan: ONNX model tidak ditemukan (error ", GetLastError(), ").",
+         Print("[XAU PULLBACK EA] Peringatan: Model ONNX tidak ditemukan (error ", GetLastError(), ").",
                " EA tetap berjalan dalam mode Rule-Based (tanpa filter ML).");
         }
       else
         {
-         // Coba konfigurasi model 19 fitur baru terlebih dahulu
          const long input_shape_19[] = {1, 19};
          const long input_shape_13[] = {1, 13};
          bool shape_set = false;
@@ -641,7 +707,7 @@ int OnInit()
            {
             onnx_feature_count = 19;
             shape_set = true;
-            Print("OnInit: Terdeteksi model ONNX 19 fitur (dengan Market Context).");
+            Print("OnInit: Terdeteksi model ONNX 19 fitur (dengan Market Context PullBack).");
            }
          else if(OnnxSetInputShape(handle_onnx, 0, input_shape_13))
            {
@@ -652,7 +718,7 @@ int OnInit()
          
          if(!shape_set)
            {
-            Print("Gagal set input shape ONNX (13 maupun 19). Error: ", GetLastError());
+            Print("Gagal set input shape ONNX. Error: ", GetLastError());
             OnnxRelease(handle_onnx);
             handle_onnx = INVALID_HANDLE;
            }
@@ -662,8 +728,8 @@ int OnInit()
             OnnxSetOutputShape(handle_onnx, 0, output_shape_label);
             const long output_shape_probs[] = {1, 2};
             OnnxSetOutputShape(handle_onnx, 1, output_shape_probs);
-            last_signal_desc = "✅ ONNX Model (" + IntegerToString(onnx_feature_count) + " fitur) dimuat";
-            Print("OnInit: Model ONNX berhasil dikonfigurasi dengan ", onnx_feature_count, " fitur input.");
+            last_signal_desc = "✅ ONNX Pullback (" + IntegerToString(onnx_feature_count) + " fitur) dimuat";
+            Print("OnInit: Model ONNX Pullback berhasil dikonfigurasi dengan ", onnx_feature_count, " fitur input.");
            }
         }
      }
@@ -680,13 +746,17 @@ int OnInit()
    //--- Timer untuk refresh dashboard setiap 1 detik
    EventSetTimer(1);
    
+   //--- Reset state pullback
+   pb_state = PB_STATE_IDLE;
+   
    //--- Ambil level bulanan awal & update dashboard
    UpdateMonthlyLevels();
    UpdateDashboard();
    
-   Print("OnInit: EA XAUUSD v2.14 AKTIF | Symbol=", trade_symbol,
+   Print("OnInit: EA XAUUSD PULLBACK v2.15 AKTIF | Symbol=", trade_symbol,
          " | Digits=", trade_digits, " | Point=", DoubleToString(trade_point, 8),
-         " | Martingale=", (InpUseMartingale ? "ON" : "OFF"),
+         " | MagicNumber=", InpMagicNumber,
+         " | Retest Timeout=", InpPullbackTimeoutSec, "s (2 Menit)",
          " | ML=", (InpUseMLFilter ? "ON" : "OFF"));
    return(INIT_SUCCEEDED);
   }
@@ -715,7 +785,7 @@ void OnDeinit(const int reason)
       handle_onnx = INVALID_HANDLE;
      }
    
-   Print("OnDeinit: EA dihentikan, reason=", reason);
+   Print("OnDeinit: EA PULLBACK dihentikan, reason=", reason);
   }
 
 //+------------------------------------------------------------------+
@@ -750,8 +820,11 @@ void OnTick()
    //--- Hitung level candle monthly
    UpdateMonthlyLevels();
    
-   //--- Deteksi sinyal entry (loop/graph engine pada bar baru)
+   //--- Deteksi sinyal entry awal (dijalankan saat bar baru M15 terbentuk)
    CheckForSignal();
+   
+   //--- State Machine: Pantau konfirmasi retest / pullback setiap tick
+   ProcessPullbackStateMachine();
    
    //--- Manajemen posisi (trailing / break-even jika di-extend)
    ManagePositions();
@@ -844,8 +917,8 @@ double ML_PredictWinProbability(int signal_type)
    
    features[0]  = (float)((cur_close - ema_value[1]) / cur_atr);                      // dist_to_ema_atr
    features[1]  = (float)adx_value[1];                                                // adx_main
-   features[2]  = (float)adx_plus_di[1];                                              // adx_pdi
-   features[3]  = (float)adx_minus_di[1];                                             // adx_mdi
+   features[2]  = (float)adx_pdi[1];                                                  // adx_pdi
+   features[3]  = (float)adx_mdi[1];                                                  // adx_mdi
    features[4]  = (float)(adx_plus_di[1] - adx_minus_di[1]);                          // adx_di_diff
    features[5]  = (float)rsi_value[1];                                                // rsi
    features[6]  = (float)(cur_atr / cur_close * 1000.0);                              // atr_normalized
@@ -896,13 +969,13 @@ double ML_PredictWinProbability(int signal_type)
    last_ml_prob = win_prob;
    
    if(InpDebugLog)
-      Print("NODE 3 (ML ONNX): Sinyal Type=", signal_type, " -> Predicted Win Prob=", DoubleToString(win_prob * 100.0, 1), "%");
+      Print("NODE 3 (ML ONNX PULLBACK): Sinyal Type=", signal_type, " -> Win Prob=", DoubleToString(win_prob * 100.0, 1), "%");
    
    return(win_prob);
   }
 
 //+------------------------------------------------------------------+
-//| Deteksi sinyal entry berdasarkan pipeline (loop/graph engine)    |
+//| Deteksi sinyal entry berdasarkan pipeline (awal bar baru M15)    |
 //+------------------------------------------------------------------+
 void CheckForSignal()
   {
@@ -911,6 +984,13 @@ void CheckForSignal()
    if(bar_time == last_bar_time) return;
    last_bar_time = bar_time;
    
+   //--- Jika ada pending retest dari bar sebelumnya yang belum terisi, otomatis batalkan
+   if(pb_state != PB_STATE_IDLE)
+     {
+      if(InpDebugLog) Print("PULLBACK RESET: Bar M15 baru terbentuk. Pending sinyal lama dibatalkan.");
+      pb_state = PB_STATE_IDLE;
+     }
+
    //--- Ambil harga & indikator dari Bar 1 (bar yang sudah terkonfirmasi resmi)
    double close1      = iClose(trade_symbol, _Period, 1);
    double ema1        = ema_value[1];
@@ -937,7 +1017,7 @@ void CheckForSignal()
       if(close1 > ema1 && adx1 >= InpADX_Strength && adx_buy_dir && rsi1 < InpRSI_Overbought)
         {
          follow_buy = true;
-         last_signal_desc = "FOLLOW BUY (Trend Bullish)";
+         last_signal_desc = "FOLLOW BUY (Trend Bullish Terkonfirmasi)";
          if(InpDebugLog) Print("NODE 1: FOLLOW BUY triggered");
         }
       
@@ -945,7 +1025,7 @@ void CheckForSignal()
       if(close1 < ema1 && adx1 >= InpADX_Strength && adx_sell_dir && rsi1 > InpRSI_Oversold)
         {
          follow_sell = true;
-         last_signal_desc = "FOLLOW SELL (Trend Bearish)";
+         last_signal_desc = "FOLLOW SELL (Trend Bearish Terkonfirmasi)";
          if(InpDebugLog) Print("NODE 1: FOLLOW SELL triggered");
         }
      }
@@ -1023,7 +1103,7 @@ void CheckForSignal()
      }
    
    //=================================================================
-   //=== NODE 4: Keputusan akhir masuk posisi                      ===
+   //=== NODE 4: Penjadwalan Masuk Posisi (Pullback vs Instant)    ===
    //=================================================================
    if(!do_buy && !do_sell) return; // tidak ada sinyal
    
@@ -1035,9 +1115,135 @@ void CheckForSignal()
       return;
      }
    
-   //--- Eksekusi order
-   if(do_buy && InpIsBuyAllowed)   OpenPosition(ORDER_TYPE_BUY);
-   if(do_sell && InpIsSellAllowed) OpenPosition(ORDER_TYPE_SELL);
+   //--- Jika mode Pullback dinonaktifkan, langsung eksekusi instan di harga open bar baru
+   if(!InpUsePullback)
+     {
+      if(do_buy && InpIsBuyAllowed)   OpenPosition(ORDER_TYPE_BUY);
+      if(do_sell && InpIsSellAllowed) OpenPosition(ORDER_TYPE_SELL);
+      return;
+     }
+
+   //--- MODE PULLBACK AKTIF: Hitung batas jarak diskon & batas cancel
+   double cur_atr = (ArraySize(atr_value) > 1 && atr_value[1] > 0) ? atr_value[1] : (trade_point * 100.0);
+   double discount_dist = 0.0;
+   double cancel_dist   = 0.0;
+
+   if(InpPullbackDistMode == PULLBACK_DIST_ATR)
+     {
+      discount_dist = cur_atr * InpPullbackATR_Mult;
+      cancel_dist   = cur_atr * InpCancelATR_Mult;
+     }
+   else
+     {
+      discount_dist = InpPullbackFixedPts * trade_point;
+      cancel_dist   = InpCancelFixedPts * trade_point;
+     }
+
+   if(do_buy && InpIsBuyAllowed)
+     {
+      pb_state        = PB_STATE_PENDING_BUY;
+      pb_signal_time  = TimeCurrent();
+      pb_ref_price    = SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+      pb_target_price = NormalizeDouble(pb_ref_price - discount_dist, trade_digits); // Koreksi ke bawah (diskon beli)
+      pb_cancel_price = NormalizeDouble(pb_ref_price + cancel_dist, trade_digits);   // Batal jika harga langsung lari ke atas
+      last_signal_desc = "PULLBACK BUY (Menunggu Diskon <= " + DoubleToString(pb_target_price, trade_digits) + " dalam " + IntegerToString(InpPullbackTimeoutSec) + "s)";
+      if(InpDebugLog)
+         Print("PULLBACK ARMED [BUY]: Ref=", DoubleToString(pb_ref_price, trade_digits),
+               " | Diskon Target<=", DoubleToString(pb_target_price, trade_digits),
+               " | Cancel Boundary>=", DoubleToString(pb_cancel_price, trade_digits),
+               " | Timeout=", InpPullbackTimeoutSec, "s");
+     }
+   else if(do_sell && InpIsSellAllowed)
+     {
+      pb_state        = PB_STATE_PENDING_SELL;
+      pb_signal_time  = TimeCurrent();
+      pb_ref_price    = SymbolInfoDouble(trade_symbol, SYMBOL_BID);
+      pb_target_price = NormalizeDouble(pb_ref_price + discount_dist, trade_digits); // Koreksi ke atas (diskon jual)
+      pb_cancel_price = NormalizeDouble(pb_ref_price - cancel_dist, trade_digits);   // Batal jika harga langsung dump ke bawah
+      last_signal_desc = "PULLBACK SELL (Menunggu Diskon >= " + DoubleToString(pb_target_price, trade_digits) + " dalam " + IntegerToString(InpPullbackTimeoutSec) + "s)";
+      if(InpDebugLog)
+         Print("PULLBACK ARMED [SELL]: Ref=", DoubleToString(pb_ref_price, trade_digits),
+               " | Diskon Target>=", DoubleToString(pb_target_price, trade_digits),
+               " | Cancel Boundary<=", DoubleToString(pb_cancel_price, trade_digits),
+               " | Timeout=", InpPullbackTimeoutSec, "s");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| State Machine PullBack: Dieksekusi setiap tick untuk memantau    |
+//| harga koreksi (diskon), pembatalan lari, atau masa expired 2M    |
+//+------------------------------------------------------------------+
+void ProcessPullbackStateMachine()
+  {
+   if(!InpUsePullback || pb_state == PB_STATE_IDLE) return;
+   
+   // 1. Validasi batas open posisi
+   if(CountOpenPositions() >= InpMaxOpenPositions)
+     {
+      pb_state = PB_STATE_IDLE;
+      return;
+     }
+     
+   int elapsed = (int)(TimeCurrent() - pb_signal_time);
+   
+   // 2. Cek Timeout (default 120 detik / 2 menit pertama candle)
+   if(elapsed > InpPullbackTimeoutSec)
+     {
+      last_signal_desc = "Sinyal Pullback Hangus (Waktu Habis " + IntegerToString(elapsed) + "s > " + IntegerToString(InpPullbackTimeoutSec) + "s)";
+      if(InpDebugLog) Print("PULLBACK TIMEOUT: Batas 2 menit habis tanpa koreksi diskon. Sinyal dibatalkan.");
+      pb_state = PB_STATE_IDLE;
+      return;
+     }
+     
+   // 3. Evaluasi State BUY (Menunggu harga terkoreksi turun)
+   if(pb_state == PB_STATE_PENDING_BUY)
+     {
+      double ask = SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+      
+      // Kondisi A: Harga keburu terbang ke atas melewati batas cancel (Anti-FOMO)
+      if(ask >= pb_cancel_price)
+        {
+         last_signal_desc = "Sinyal BUY Dibatalkan (Harga Lari Duluan ke " + DoubleToString(ask, trade_digits) + " >= " + DoubleToString(pb_cancel_price, trade_digits) + ")";
+         if(InpDebugLog) Print("PULLBACK CANCEL: BUY dibatalkan karena harga lari ke ", ask, " >= batas ", pb_cancel_price);
+         pb_state = PB_STATE_IDLE;
+         return;
+        }
+        
+      // Kondisi B: Harga terkoreksi turun menyentuh/masuk zona diskon -> Eksekusi BUY!
+      if(ask <= pb_target_price)
+        {
+         last_signal_desc = "PULLBACK BUY Terisi! (Diskon di " + DoubleToString(ask, trade_digits) + " | Retest +" + IntegerToString(elapsed) + "s)";
+         if(InpDebugLog) Print("PULLBACK TRIGGERED: BUY dieksekusi di harga diskon ", ask, " <= target ", pb_target_price, " (waktu: ", elapsed, "s)");
+         pb_state = PB_STATE_IDLE;
+         if(InpIsBuyAllowed) OpenPosition(ORDER_TYPE_BUY);
+         return;
+        }
+     }
+     
+   // 4. Evaluasi State SELL (Menunggu harga terkoreksi naik)
+   if(pb_state == PB_STATE_PENDING_SELL)
+     {
+      double bid = SymbolInfoDouble(trade_symbol, SYMBOL_BID);
+      
+      // Kondisi A: Harga keburu dump ke bawah melewati batas cancel (Anti-FOMO)
+      if(bid <= pb_cancel_price)
+        {
+         last_signal_desc = "Sinyal SELL Dibatalkan (Harga Lari Duluan ke " + DoubleToString(bid, trade_digits) + " <= " + DoubleToString(pb_cancel_price, trade_digits) + ")";
+         if(InpDebugLog) Print("PULLBACK CANCEL: SELL dibatalkan karena harga lari ke ", bid, " <= batas ", pb_cancel_price);
+         pb_state = PB_STATE_IDLE;
+         return;
+        }
+        
+      // Kondisi B: Harga terkoreksi naik menyentuh/masuk zona diskon -> Eksekusi SELL!
+      if(bid >= pb_target_price)
+        {
+         last_signal_desc = "PULLBACK SELL Terisi! (Diskon di " + DoubleToString(bid, trade_digits) + " | Retest +" + IntegerToString(elapsed) + "s)";
+         if(InpDebugLog) Print("PULLBACK TRIGGERED: SELL dieksekusi di harga diskon ", bid, " >= target ", pb_target_price, " (waktu: ", elapsed, "s)");
+         pb_state = PB_STATE_IDLE;
+         if(InpIsSellAllowed) OpenPosition(ORDER_TYPE_SELL);
+         return;
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -1273,20 +1479,20 @@ void OpenPosition(ENUM_ORDER_TYPE type)
    //--- Eksekusi order
    bool res = false;
    if(type == ORDER_TYPE_BUY)
-      res = trade.Buy(lot, trade_symbol, price, sl, tp, "XAU Phase1+2 BUY");
+      res = trade.Buy(lot, trade_symbol, price, sl, tp, "XAU PullBack BUY");
    else if(type == ORDER_TYPE_SELL)
-      res = trade.Sell(lot, trade_symbol, price, sl, tp, "XAU Phase1+2 SELL");
+      res = trade.Sell(lot, trade_symbol, price, sl, tp, "XAU PullBack SELL");
    
    if(!res)
      {
-      Print("Gagal membuka posisi: ", trade.ResultRetcodeDescription());
+      Print("Gagal membuka posisi PullBack: ", trade.ResultRetcodeDescription());
       return;
      }
    
    if(InpDebugLog)
      {
       string type_str = (type == ORDER_TYPE_BUY) ? "BUY" : "SELL";
-      Print("Posisi ", type_str, " terbuka: lot=", DoubleToString(lot, 2),
+      Print("Posisi PullBack ", type_str, " terbuka: lot=", DoubleToString(lot, 2),
             " price=", DoubleToString(price, trade_digits),
             " sl=", DoubleToString(sl, trade_digits),
             " tp=", DoubleToString(tp, trade_digits));
@@ -1349,96 +1555,70 @@ void ManagePositions()
    //=================================================================
    if(InpUseTrailing && current_level == 1)
      {
-      long stop_level    = SymbolInfoInteger(trade_symbol, SYMBOL_TRADE_STOPS_LEVEL);
-      double min_sl_dist = (double)stop_level * trade_point;
-
       for(int i = PositionsTotal() - 1; i >= 0; i--)
         {
-         if(!pos_info.SelectByIndex(i)) continue;
-         if(pos_info.Symbol() != trade_symbol || pos_info.Magic() != InpMagicNumber) continue;
-
-         double pos_open = pos_info.PriceOpen();
-         double pos_sl   = pos_info.StopLoss();
-         ulong  ticket   = pos_info.Ticket();
-
-         if(pos_info.PositionType() == POSITION_TYPE_BUY)
+         if(pos_info.SelectByIndex(i))
            {
-            double bid = SymbolInfoDouble(trade_symbol, SYMBOL_BID);
-            double profit_pts = (bid - pos_open) / trade_point;
-
-            // Aktifkan trailing hanya saat profit sudah mencapai start points
-            if(profit_pts >= InpTrailingStartPts)
+            if(pos_info.Symbol() == trade_symbol && pos_info.Magic() == InpMagicNumber)
               {
+               ENUM_POSITION_TYPE p_type = pos_info.PositionType();
+               double open_p  = pos_info.PriceOpen();
+               double cur_sl  = pos_info.StopLoss();
+               double cur_tp  = pos_info.TakeProfit();
+               ulong  ticket  = pos_info.Ticket();
+               double cur_p   = (p_type == POSITION_TYPE_BUY) ? SymbolInfoDouble(trade_symbol, SYMBOL_BID)
+                                                              : SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+
+               double profit_pts = (p_type == POSITION_TYPE_BUY) ? (cur_p - open_p) / trade_point
+                                                                 : (open_p - cur_p) / trade_point;
+
+               // Mode 0: Step-Lock (Kunci profit bertahap per milestone)
                if(InpTrailingMode == TRAIL_STEP_LOCK)
                  {
-                  double excess_pts = profit_pts - InpTrailingStartPts;
-                  int steps = (InpTrailingStepPoints > 0) ? (int)MathFloor(excess_pts / InpTrailingStepPoints) : 0;
-                  double target_lock_pts = InpTrailingLockPts + (steps * InpTrailingMovePoints);
-                  double new_sl = NormalizeDouble(pos_open + (target_lock_pts * trade_point), trade_digits);
-
-                  // Pastikan SL baru lebih tinggi dari SL lama & memenuhi STOPS_LEVEL
-                  if(new_sl > pos_sl && (bid - new_sl) >= min_sl_dist)
+                  if(profit_pts >= InpTrailingStartPts)
                     {
-                     if(trade.PositionModify(ticket, new_sl, pos_info.TakeProfit()))
+                     double excess_pts = profit_pts - InpTrailingStartPts;
+                     int steps = (InpTrailingStepPoints > 0) ? (int)MathFloor(excess_pts / InpTrailingStepPoints) : 0;
+                     double lock_pts = InpTrailingLockPts + (steps * InpTrailingMovePoints);
+                     double new_sl   = (p_type == POSITION_TYPE_BUY) ? (open_p + lock_pts * trade_point)
+                                                                     : (open_p - lock_pts * trade_point);
+                     new_sl = NormalizeDouble(new_sl, trade_digits);
+
+                     bool need_modify = false;
+                     if(p_type == POSITION_TYPE_BUY  && (cur_sl == 0.0 || new_sl > cur_sl + trade_point)) need_modify = true;
+                     if(p_type == POSITION_TYPE_SELL && (cur_sl == 0.0 || new_sl < cur_sl - trade_point)) need_modify = true;
+
+                     if(need_modify)
                        {
-                        if(InpDebugLog) Print("STEP-LOCK TRAILING BUY: SL naik ke ", DoubleToString(new_sl, trade_digits),
-                                             " (Locked: +", DoubleToString(target_lock_pts, 0), " pts | Step: ", steps,
-                                             ") | Bid=", DoubleToString(bid, trade_digits));
+                        if(trade.PositionModify(ticket, new_sl, cur_tp))
+                          {
+                           if(InpDebugLog)
+                              Print("STEP-LOCK TRAILING: Posisi ticket=", ticket, " SL dikunci ke ", DoubleToString(new_sl, trade_digits),
+                                    " (+", DoubleToString(lock_pts, 0), " pts profit terkunci, Step ke-", steps, ")");
+                          }
                        }
                     }
                  }
-               else // TRAIL_CLASSIC
+               // Mode 1: Classic Trailing
+               else if(InpTrailingMode == TRAIL_CLASSIC)
                  {
-                  double trail_dist = InpTrailingDistPts * trade_point;
-                  double trail_step = InpTrailingStepPts * trade_point;
-                  double new_sl = NormalizeDouble(bid - trail_dist, trade_digits);
-                  if(new_sl > pos_sl + trail_step && (bid - new_sl) >= min_sl_dist)
+                  if(profit_pts >= InpTrailingStartPts)
                     {
-                     if(trade.PositionModify(ticket, new_sl, pos_info.TakeProfit()))
-                       {
-                        if(InpDebugLog) Print("CLASSIC TRAILING BUY: SL naik ke ", DoubleToString(new_sl, trade_digits),
-                                             " | Bid=", DoubleToString(bid, trade_digits));
-                       }
-                    }
-                 }
-              }
-           }
-         else if(pos_info.PositionType() == POSITION_TYPE_SELL)
-           {
-            double ask = SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
-            double profit_pts = (pos_open - ask) / trade_point;
+                     double new_sl = (p_type == POSITION_TYPE_BUY) ? (cur_p - InpTrailingDistPts * trade_point)
+                                                                   : (cur_p + InpTrailingDistPts * trade_point);
+                     new_sl = NormalizeDouble(new_sl, trade_digits);
 
-            if(profit_pts >= InpTrailingStartPts)
-              {
-               if(InpTrailingMode == TRAIL_STEP_LOCK)
-                 {
-                  double excess_pts = profit_pts - InpTrailingStartPts;
-                  int steps = (InpTrailingStepPoints > 0) ? (int)MathFloor(excess_pts / InpTrailingStepPoints) : 0;
-                  double target_lock_pts = InpTrailingLockPts + (steps * InpTrailingMovePoints);
-                  double new_sl = NormalizeDouble(pos_open - (target_lock_pts * trade_point), trade_digits);
+                     bool need_modify = false;
+                     if(p_type == POSITION_TYPE_BUY  && (cur_sl == 0.0 || new_sl >= cur_sl + InpTrailingStepPts * trade_point)) need_modify = true;
+                     if(p_type == POSITION_TYPE_SELL && (cur_sl == 0.0 || new_sl <= cur_sl - InpTrailingStepPts * trade_point)) need_modify = true;
 
-                  // Pastikan SL baru lebih rendah dari SL lama (atau belum ada SL) & memenuhi STOPS_LEVEL
-                  if((pos_sl == 0 || new_sl < pos_sl) && (new_sl - ask) >= min_sl_dist)
-                    {
-                     if(trade.PositionModify(ticket, new_sl, pos_info.TakeProfit()))
+                     if(need_modify)
                        {
-                        if(InpDebugLog) Print("STEP-LOCK TRAILING SELL: SL turun ke ", DoubleToString(new_sl, trade_digits),
-                                             " (Locked: +", DoubleToString(target_lock_pts, 0), " pts | Step: ", steps,
-                                             ") | Ask=", DoubleToString(ask, trade_digits));
-                       }
-                    }
-                 }
-               else // TRAIL_CLASSIC
-                 {
-                  double trail_dist = InpTrailingDistPts * trade_point;
-                  double trail_step = InpTrailingStepPts * trade_point;
-                  double new_sl = NormalizeDouble(ask + trail_dist, trade_digits);
-                  if((pos_sl == 0 || new_sl < pos_sl - trail_step) && (new_sl - ask) >= min_sl_dist)
-                    {
-                     if(trade.PositionModify(ticket, new_sl, pos_info.TakeProfit()))
-                       {
-                        if(InpDebugLog) Print("CLASSIC TRAILING SELL: SL turun ke ", DoubleToString(new_sl, trade_digits),
-                                             " | Ask=", DoubleToString(ask, trade_digits));
+                        if(trade.PositionModify(ticket, new_sl, cur_tp))
+                          {
+                           if(InpDebugLog)
+                              Print("CLASSIC TRAILING: Posisi ticket=", ticket, " SL digeser ke ", DoubleToString(new_sl, trade_digits));
+                          }
                        }
                     }
                  }
@@ -1448,52 +1628,37 @@ void ManagePositions()
      }
 
    //=================================================================
-   //=== BAGIAN 3: Martingale Averaging Recovery Engine            ===
+   //=== BAGIAN 3: Dynamic Martingale Averaging Recovery Engine     ===
    //=================================================================
    if(!InpUseMartingale) return;
 
-   //--- 3a. Basket Trailing Profit Step-Lock berbasis USD (martingale group)
+   //--- 3a. Basket Trailing Profit (ketika ada 1 posisi atau lebih)
    if(InpUseBasketTrailing)
      {
-      //--- Fase 1: Cek apakah floating profit mencapai Start → aktifkan trailing
-      if(total_float >= InpBasketTrailStartUSD)
+      if(!basket_trailing_active && total_float >= InpBasketTrailStartUSD)
         {
-         if(!basket_trailing_active)
-           {
-            basket_trailing_active = true;
-            basket_max_profit      = total_float;
-            // Hitung lock level awal (step 0)
-            double init_lock = InpBasketTrailLockUSD;
-            Print("BASKET STEP-LOCK: Aktif! Floating +$", DoubleToString(total_float, 2),
-                  " >= Start $", DoubleToString(InpBasketTrailStartUSD, 2),
-                  " → Lock awal dikunci di +$", DoubleToString(init_lock, 2));
-           }
-         else if(total_float > basket_max_profit)
-           {
-            basket_max_profit = total_float;
-            // Hitung berapa milestone/step yang sudah dicapai
-            double b_excess = basket_max_profit - InpBasketTrailStartUSD;
-            int    b_steps  = (InpBasketTrailStepUSD > 0) ? (int)MathFloor(b_excess / InpBasketTrailStepUSD) : 0;
-            double b_lock   = InpBasketTrailLockUSD + (b_steps * InpBasketTrailMoveUSD);
-            if(InpDebugLog) Print("BASKET STEP-LOCK: Peak naik → +$", DoubleToString(basket_max_profit, 2),
-                                  " | Step ke-", b_steps,
-                                  " | Lock dinaikkan ke +$", DoubleToString(b_lock, 2));
-           }
+         basket_trailing_active = true;
+         basket_max_profit      = total_float;
+         Print("BASKET TRAILING AKTIF: Floating profit $", DoubleToString(total_float, 2),
+               " >= Start $", DoubleToString(InpBasketTrailStartUSD, 2),
+               " | Profit awal yang dikunci: $", DoubleToString(InpBasketTrailLockUSD, 2));
         }
 
-      //--- Fase 2: Eksekusi exit jika floating profit turun menyentuh atau di bawah nilai lock saat ini
       if(basket_trailing_active)
         {
-         double b_excess    = basket_max_profit - InpBasketTrailStartUSD;
-         int    b_steps     = (InpBasketTrailStepUSD > 0) ? (int)MathFloor(b_excess / InpBasketTrailStepUSD) : 0;
-         double b_lock_now  = InpBasketTrailLockUSD + (b_steps * InpBasketTrailMoveUSD);
+         if(total_float > basket_max_profit)
+            basket_max_profit = total_float;
 
-         if(total_float <= b_lock_now)
+         double excess_profit = basket_max_profit - InpBasketTrailStartUSD;
+         int steps = (InpBasketTrailStepUSD > 0) ? (int)MathFloor(excess_profit / InpBasketTrailStepUSD) : 0;
+         double current_lock_usd = InpBasketTrailLockUSD + (steps * InpBasketTrailMoveUSD);
+
+         if(total_float < current_lock_usd)
            {
-            Print("BASKET STEP-LOCK EXIT: Floating +$", DoubleToString(total_float, 2),
-                  " <= Lock +$", DoubleToString(b_lock_now, 2),
-                  " (Peak: +$", DoubleToString(basket_max_profit, 2),
-                  " | Step ke-", b_steps, ") → Tutup semua ", current_level, " posisi");
+            Print("BASKET TRAILING HIT: Floating turun ke $", DoubleToString(total_float, 2),
+                  " < Lock Level $", DoubleToString(current_lock_usd, 2),
+                  " (Peak: $", DoubleToString(basket_max_profit, 2), ", Step ke-", steps, ")",
+                  " → Tutup SEMUA ", current_level, " posisi!");
             basket_trailing_active = false;
             basket_max_profit      = 0.0;
             CloseAllPositions();
@@ -1502,62 +1667,67 @@ void ManagePositions()
         }
      }
 
-   //--- 3b. Fallback: Instant close saat profit target poin tercapai (jika basket trailing off)
-   if(!InpUseBasketTrailing)
+   //--- 3b. Cek Target Profit Fixed Poin untuk semua posisi Martingale (jika trailing off)
+   if(!InpUseBasketTrailing && current_level > 1)
      {
-      double tick_value   = SymbolInfoDouble(trade_symbol, SYMBOL_TRADE_TICK_VALUE);
-      double tick_size    = SymbolInfoDouble(trade_symbol, SYMBOL_TRADE_TICK_SIZE);
-      double target_money = InpMartingaleProfitPts * tick_value *
-                            (tick_size > 0 ? (trade_point / tick_size) : 1.0);
-      if(total_float >= target_money && current_level > 1)
+      double first_entry = 0.0, last_entry_unused = 0.0;
+      ENUM_POSITION_TYPE p_type;
+      if(GetFirstPosition(p_type, first_entry, last_entry_unused))
         {
-         Print("MARTINGALE RECOVERY: Total floating profit $", DoubleToString(total_float, 2),
-               " >= target $", DoubleToString(target_money, 2), " → Tutup semua ", current_level, " posisi");
-         CloseAllPositions();
-         return;
+         double cur_price = (p_type == POSITION_TYPE_BUY) ? SymbolInfoDouble(trade_symbol, SYMBOL_BID)
+                                                          : SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+         double profit_dist_pts = (p_type == POSITION_TYPE_BUY) ? (cur_price - first_entry) / trade_point
+                                                                : (first_entry - cur_price) / trade_point;
+         if(profit_dist_pts >= InpMartingaleProfitPts)
+           {
+            Print("MARTINGALE: Target profit total tercapai (+", DoubleToString(profit_dist_pts, 0), " poin) → Tutup semua posisi!");
+            CloseAllPositions();
+            return;
+           }
         }
      }
 
-   //--- 3c. Cek apakah sudah mencapai max level averaging
-   if(current_level > InpMaxMartingaleStep)
+   //--- 3c. Cek apakah level averaging sudah mencapai batas maksimal
+   if(current_level >= (1 + InpMaxMartingaleStep)) return;
+
+   //--- 3d. Cek Risk Margin Guard
+   double margin_used = AccountInfoDouble(ACCOUNT_MARGIN);
+   if(equity > 0 && (margin_used / equity * 100.0) >= InpMaxRiskMargin)
      {
-      if(InpDebugLog) Print("MARTINGALE: Level max (", InpMaxMartingaleStep, ") sudah tercapai, tidak tambah posisi lagi");
+      if(InpDebugLog) Print("MARTINGALE GUARD: Margin sudah mencapai batas aman (", DoubleToString(margin_used/equity*100.0, 1), "% >= ", InpMaxRiskMargin, "%)");
       return;
      }
 
-   //--- 3d. Ambil info posisi pertama dan terakhir yang terbuka
+   //--- 3e. Dapatkan harga entry terakhir dan arah posisi
+   double first_entry_price = 0.0, last_entry = 0.0;
    ENUM_POSITION_TYPE pos_type;
-   double first_entry = 0.0;
-   double last_entry  = 0.0;
-   if(!GetFirstPosition(pos_type, first_entry, last_entry)) return;
+   if(!GetFirstPosition(pos_type, first_entry_price, last_entry)) return;
 
-   double cur_price = (pos_type == POSITION_TYPE_BUY) ?
-                      SymbolInfoDouble(trade_symbol, SYMBOL_BID) :
-                      SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+   double cur_price = (pos_type == POSITION_TYPE_BUY) ? SymbolInfoDouble(trade_symbol, SYMBOL_ASK)
+                                                      : SymbolInfoDouble(trade_symbol, SYMBOL_BID);
 
-   //--- 3e. Hitung jarak averaging (ATR atau Fixed)
+   // Hitung jarak grid yang dibutuhkan
    double dist_pts = 0.0;
    if(InpMartiDistMode == MARTI_DIST_ATR)
      {
-      double cur_atr = (ArraySize(atr_value) > 1 && atr_value[1] > 0) ?
-                       atr_value[1] : (InpMartingaleDistPts * trade_point);
-      dist_pts = cur_atr * InpMartiATR_Mult;
-      if(InpDebugLog) Print("MARTINGALE ATR DIST: ATR=", DoubleToString(cur_atr / trade_point, 0),
-                            " pts | Mult=", InpMartiATR_Mult, " | Jarak=", DoubleToString(dist_pts / trade_point, 0), " pts");
+      double atr = (atr_value[1] > 0) ? atr_value[1] : (InpMartingaleDistPts * trade_point / InpMartiATR_Mult);
+      dist_pts = atr * InpMartiATR_Mult;
      }
    else
+     {
       dist_pts = InpMartingaleDistPts * trade_point;
+     }
 
    //--- 3f. Cek apakah harga sudah bergerak cukup BERLAWANAN arah dari entry terakhir
    bool should_average = false;
    if(pos_type == POSITION_TYPE_BUY && cur_price <= last_entry - dist_pts)
-      should_average = true;  // Harga turun X poin dari entry terakhir → averaging BUY lagi
+      should_average = true;
    else if(pos_type == POSITION_TYPE_SELL && cur_price >= last_entry + dist_pts)
-      should_average = true;  // Harga naik X poin dari entry terakhir → averaging SELL lagi
+      should_average = true;
 
    if(!should_average) return;
 
-   //--- 3g. Hitung lot untuk posisi averaging (lot dasar × multiplier^level)
+   //--- 3g. Hitung lot untuk posisi averaging
    double base_lot = InpFixedLot;
    if(InpLotMode == LOT_RISK_PERCENT)
      {
@@ -1582,9 +1752,9 @@ void ManagePositions()
    avg_lot = MathMax(min_lot, MathMin(max_lot, avg_lot));
    avg_lot = NormalizeDouble(avg_lot, 2);
 
-   //--- Buka posisi averaging tanpa SL/TP (ditutup oleh basket trailing / profit target)
+   //--- Buka posisi averaging tanpa SL/TP individual
    bool res = false;
-   string comment = "XAU Averaging L" + IntegerToString(current_level);
+   string comment = "XAU PB Averaging L" + IntegerToString(current_level);
 
    if(pos_type == POSITION_TYPE_BUY)
       res = trade.Buy(avg_lot, trade_symbol, 0, 0, 0, comment);
@@ -1592,11 +1762,9 @@ void ManagePositions()
       res = trade.Sell(avg_lot, trade_symbol, 0, 0, 0, comment);
 
    if(res)
-      Print("MARTINGALE AVERAGING: Level ", current_level, " | Lot=", DoubleToString(avg_lot, 2),
+      Print("MARTINGALE AVERAGING (PULLBACK): Level ", current_level, " | Lot=", DoubleToString(avg_lot, 2),
             " | Harga=", DoubleToString(cur_price, trade_digits),
-            " | Jarak dari entry terakhir=", DoubleToString(MathAbs(cur_price - last_entry) / trade_point, 0), " poin",
-            " | Mode Grid: ", (InpMartiDistMode == MARTI_DIST_ATR ? "ATR" : "Fixed"),
-            " | Grid dist=", DoubleToString(dist_pts / trade_point, 0), " pts");
+            " | Jarak dari entry terakhir=", DoubleToString(MathAbs(cur_price - last_entry) / trade_point, 0), " poin");
    else
       Print("MARTINGALE AVERAGING: Gagal buka posisi level ", current_level, " | Error: ", trade.ResultRetcodeDescription());
   }
@@ -1616,14 +1784,14 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
   {
    if(id == CHARTEVENT_CLICK && InpDebugLog)
      {
-      Print("=== DEBUG BAR (", trade_symbol, ") ===");
+      Print("=== DEBUG PULLBACK BAR (", trade_symbol, ") ===");
       Print("Time: ", TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS));
       Print("Close(1): ", DoubleToString(iClose(trade_symbol, _Period, 1), trade_digits));
       Print("EMA(1):   ", DoubleToString(ema_value[1], trade_digits));
       Print("ADX(1):   ", DoubleToString(adx_value[1], trade_digits), " (+DI: ", DoubleToString(adx_plus_di[1], 2), " -DI: ", DoubleToString(adx_minus_di[1], 2), ")");
       Print("RSI(1):   ", DoubleToString(rsi_value[1], trade_digits));
       Print("ATR(1):   ", DoubleToString(atr_value[1], trade_digits));
-      Print("Prev Month H/L: ", DoubleToString(monthly_high, trade_digits), " / ", DoubleToString(monthly_low, trade_digits));
+      Print("State:    ", EnumToString(pb_state), " | Ref=", pb_ref_price, " Target=", pb_target_price, " Cancel=", pb_cancel_price);
      }
   }
 //+------------------------------------------------------------------+

@@ -1,15 +1,15 @@
 //+------------------------------------------------------------------+
-//|                                        XAU_Phase_Reversal.mq5    |
-//|                 Expert Advisor XAUUSD | Reversal Contrarian Engine|
+//|                               XAU_Reversal_Pullback.mq5          |
+//|      Expert Advisor XAUUSD | Reversal Contrarian + PullBack      |
 //|   EMA + ADX + RSI + Confirmed Candle + ONNX Filter + Dashboard   |
-//|   + Dynamic Martingale Recovery Engine                           |
-//|   (Kebalikan/Inverse dari XAU_Phase1.mq5)                        |
+//|   + Pullback Discount State Machine + Martingale Recovery        |
+//|   (Contrarian/Inverse Signal + Tunggu 2M Retest + Anti-FOMO)     |
 //+------------------------------------------------------------------+
-#property copyright   "XAU Reversal Engine"
+#property copyright   "XAU Reversal PullBack Engine"
 #property link        ""
-#property version     "2.14"
+#property version     "2.16"
 #property strict
-#property description "EA XAUUSD REVERSAL: Contrarian/Inverse Logic dari Phase 1 + ONNX ML + Dashboard + Martingale + Step-Lock Trailing"
+#property description "EA XAUUSD REVERSAL-PULLBACK: Contrarian/Inverse + Discount Retest 2M State Machine + ONNX ML + Dashboard + Martingale"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -17,8 +17,8 @@
 #include <Trade\DealInfo.mqh>
 #include <Trade\HistoryOrderInfo.mqh>
 
-//--- Resource model ONNX (tertanam langsung ke dalam file .ex5)
-#resource "model_xau.onnx" as uchar ExtModelONNX[]
+//--- Resource model ONNX Pullback (tertanam langsung ke dalam file .ex5)
+#resource "model_xau_pullback.onnx" as uchar ExtModelONNX[]
 
 //+------------------------------------------------------------------+
 //| ENUM types                                                       |
@@ -64,11 +64,36 @@ enum ENUM_MARTI_DIST_MODE
    MARTI_DIST_FIXED  // 1: Fixed Jarak (poin)
   };
 
+enum ENUM_PULLBACK_DIST_MODE
+  {
+   PULLBACK_DIST_ATR,   // 0: Dinamis berbasis ATR
+   PULLBACK_DIST_FIXED  // 1: Fixed Jarak (poin)
+  };
+
+enum ENUM_PULLBACK_STATE
+  {
+   PB_STATE_IDLE,         // Tidak ada sinyal pending
+   PB_STATE_PENDING_BUY,  // Sinyal BUY contrarian terdeteksi, menunggu retest naik ke zona diskon
+   PB_STATE_PENDING_SELL  // Sinyal SELL contrarian terdeteksi, menunggu retest turun ke zona diskon
+  };
+
 //===================================================================
 //=== INPUT GROUP: SYMBOL & BROKER SETTINGS                        ===
 //===================================================================
 sinput group "===== SYMBOL & BROKER SETTINGS ====="
 input string             InpCustomSymbol = "";             // Custom Symbol (kosongkan = otomatis chart, misal XAUUSD.vx)
+
+//===================================================================
+//=== INPUT GROUP: PULLBACK & RETEST DISCOUNT ENGINE               ===
+//===================================================================
+sinput group "===== PULLBACK / DISCOUNT RETEST ENGINE (CONTRARIAN) ====="
+input bool                     InpUsePullback        = true;              // Aktifkan Eksekusi Tunggu Pullback / Retest Contrarian
+input int                      InpPullbackTimeoutSec = 120;               // Waktu Tunggu Koreksi (detik; default 120s = 2 menit)
+input ENUM_PULLBACK_DIST_MODE  InpPullbackDistMode   = PULLBACK_DIST_ATR; // Mode Jarak Diskon Koreksi
+input double                   InpPullbackATR_Mult   = 0.20;              // Multiplier ATR untuk Diskon Contrarian (jika Mode ATR, misal 0.2x ATR)
+input double                   InpPullbackFixedPts   = 50.0;              // Jarak Poin Diskon Contrarian (jika Mode Fixed, misal 50 poin)
+input double                   InpCancelATR_Mult     = 0.25;              // Batas Batal jika Lari Duluan (ATR Mult)
+input double                   InpCancelFixedPts     = 60.0;              // Batas Batal jika Lari Duluan (Poin Fixed)
 
 //===================================================================
 //=== INPUT GROUP: INDIKATOR DASAR                                 ===
@@ -188,7 +213,7 @@ int      handle_ATR_Fast = INVALID_HANDLE; // ATR Cepat untuk Volatility Regime 
 
 // ONNX Model handle
 long     handle_onnx     = INVALID_HANDLE;
-int      onnx_feature_count = 13; // Otomatis mendeteksi model 13 fitur lama atau 19 fitur baru
+int      onnx_feature_count = 19; // Default 19 fitur untuk model Pullback
 double   last_ml_prob    = 0.0;
 string   last_signal_desc = "Belum Ada Sinyal";
 
@@ -212,6 +237,13 @@ datetime last_bar_time = 0;
 // Basket Trailing Profit tracking
 double   basket_max_profit      = 0.0;
 bool     basket_trailing_active = false;
+
+// Pullback State Machine Variables (Contrarian)
+ENUM_PULLBACK_STATE pb_state        = PB_STATE_IDLE;
+datetime            pb_signal_time  = 0;
+double              pb_ref_price    = 0.0;
+double              pb_target_price = 0.0;
+double              pb_cancel_price = 0.0;
 
 // Trade objects
 CTrade         trade;
@@ -516,16 +548,48 @@ void UpdateDashboard()
    string float_sign = (total_float >= 0.0) ? "+$" : "-$";
    string float_str  = float_sign + DoubleToString(MathAbs(total_float), 2);
 
+   // Pullback state description (contrarian flavor)
+   string pb_status_desc;
+   if(!InpUsePullback)
+     {
+      pb_status_desc = "NONAKTIF (Instant Entry Contrarian)";
+     }
+   else if(pb_state == PB_STATE_IDLE)
+     {
+      pb_status_desc = "IDLE (Siap Menunggu Sinyal Contrarian Bar Baru)";
+     }
+   else if(pb_state == PB_STATE_PENDING_BUY)
+     {
+      int elapsed = (int)(TimeCurrent() - pb_signal_time);
+      int remain  = MathMax(0, InpPullbackTimeoutSec - elapsed);
+      pb_status_desc = "CONTRARIAN BUY: Tunggu Retest Naik >= " + DoubleToString(pb_target_price, trade_digits) +
+                       " | Batal jika <= " + DoubleToString(pb_cancel_price, trade_digits) +
+                       " | Sisa: " + IntegerToString(remain) + "s";
+     }
+   else if(pb_state == PB_STATE_PENDING_SELL)
+     {
+      int elapsed = (int)(TimeCurrent() - pb_signal_time);
+      int remain  = MathMax(0, InpPullbackTimeoutSec - elapsed);
+      pb_status_desc = "CONTRARIAN SELL: Tunggu Retest Turun <= " + DoubleToString(pb_target_price, trade_digits) +
+                       " | Batal jika >= " + DoubleToString(pb_cancel_price, trade_digits) +
+                       " | Sisa: " + IntegerToString(remain) + "s";
+     }
+
    string text = "";
    text += "====================================================\n";
-   text += "[XAU AI ENGINE v2.14 - REVERSAL CONTRARIAN]\n";
+   text += "[XAU REVERSAL-PULLBACK ENGINE v2.16 ONNX ML]\n";
    text += "====================================================\n";
-   text += "- Status EA           : RUNNING [AKTIF - REVERSAL MODE]\n";
+   text += "- Status EA           : RUNNING [AKTIF - CONTRARIAN PULLBACK]\n";
    text += "- Magic Number        : " + IntegerToString(InpMagicNumber) + "\n";
    text += "- Pair / Timeframe    : " + trade_symbol + " | " + EnumToString(_Period) + "\n";
    text += "- Spread Saat Ini     : " + IntegerToString(spread) + " Poin\n";
    text += "- Target SL / TP      : SL [" + sl_desc + "] | TP [" + tp_desc + "]\n";
    text += "- Jam Server          : " + TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS) + "\n";
+   text += "----------------------------------------------------\n";
+   text += "[PULLBACK / RETEST DISCOUNT STATE - CONTRARIAN]\n";
+   text += "- Retest Mode         : " + (InpPullbackDistMode == PULLBACK_DIST_ATR ? ("ATR x" + DoubleToString(InpPullbackATR_Mult, 2)) : (DoubleToString(InpPullbackFixedPts, 0) + " pts")) +
+           " | Timeout: " + IntegerToString(InpPullbackTimeoutSec) + "s (2 Menit)\n";
+   text += "- Status Pullback     : " + pb_status_desc + "\n";
    text += "----------------------------------------------------\n";
    text += "[STATUS INDIKATOR & PASAR]\n";
    text += "- EMA (" + IntegerToString(InpEMA_Period) + ") Trend    : " + ema_trend + "\n";
@@ -534,7 +598,7 @@ void UpdateDashboard()
    text += "- RSI (" + IntegerToString(InpRSI_Period) + ") Value    : " + rsi_val_str + "\n";
    text += "- Monthly H/L (Prev)  : High=" + DoubleToString(monthly_high, trade_digits) + " | Low=" + DoubleToString(monthly_low, trade_digits) + "\n";
    text += "----------------------------------------------------\n";
-   text += "[MACHINE LEARNING - ONNX NODE 3]\n";
+   text += "[MACHINE LEARNING - ONNX REVERSAL-PULLBACK]\n";
    text += "- Filter ML ONNX      : " + ml_status + "\n";
    text += "- Sinyal Terakhir     : " + last_signal_desc + "\n";
    text += "----------------------------------------------------\n";
@@ -605,7 +669,7 @@ int OnInit()
    ArraySetAsSeries(atr_value, true);
    ArraySetAsSeries(atr_fast_value, true);
    
-   //--- Inisialisasi model ONNX (Fase 2)
+   //--- Inisialisasi model ONNX Pullback
    //    Jika gagal, EA tetap BERJALAN dalam mode rule-based (ONNX bypass)
    if(InpUseMLFilter)
      {
@@ -614,22 +678,26 @@ int OnInit()
         {
          handle_onnx = OnnxCreateFromBuffer(ExtModelONNX, ONNX_DEFAULT);
          if(handle_onnx != INVALID_HANDLE)
-            Print("OnInit: Model ONNX berhasil dimuat langsung dari resource biner tersemat (Embedded .ex5).");
+            Print("OnInit: Model ONNX Pullback berhasil dimuat langsung dari resource biner tersemat (Embedded .ex5).");
         }
       
       //--- 2. Fallback: coba load dari file fisik disk MQL5/Files/
       if(handle_onnx == INVALID_HANDLE)
-         handle_onnx = OnnxCreate("model_xau.onnx", ONNX_DEFAULT);
+         handle_onnx = OnnxCreate("model_xau_pullback.onnx", ONNX_DEFAULT);
       
       //--- 3. Fallback: coba dari subfolder Experts
       if(handle_onnx == INVALID_HANDLE)
-         handle_onnx = OnnxCreate("Experts\\model_xau.onnx", ONNX_DEFAULT);
+         handle_onnx = OnnxCreate("Experts\\model_xau_pullback.onnx", ONNX_DEFAULT);
+      
+      //--- 4. Fallback legacy model_xau.onnx jika pullback belum terkompilasi
+      if(handle_onnx == INVALID_HANDLE)
+         handle_onnx = OnnxCreate("model_xau.onnx", ONNX_DEFAULT);
       
       if(handle_onnx == INVALID_HANDLE)
         {
          //--- EA tetap berjalan tapi ML dinonaktifkan otomatis
          last_signal_desc = "⚠️ ONNX gagal load! EA jalan tanpa filter ML";
-         Print("[XAU EA REVERSAL] Peringatan: ONNX model tidak ditemukan (error ", GetLastError(), ").",
+         Print("[XAU REVERSAL-PULLBACK EA] Peringatan: ONNX model tidak ditemukan (error ", GetLastError(), ").",
                " EA tetap berjalan dalam mode Rule-Based (tanpa filter ML).");
         }
       else
@@ -664,8 +732,8 @@ int OnInit()
             OnnxSetOutputShape(handle_onnx, 0, output_shape_label);
             const long output_shape_probs[] = {1, 2};
             OnnxSetOutputShape(handle_onnx, 1, output_shape_probs);
-            last_signal_desc = "✅ ONNX Model (" + IntegerToString(onnx_feature_count) + " fitur) dimuat";
-            Print("OnInit: Model ONNX berhasil dikonfigurasi dengan ", onnx_feature_count, " fitur input.");
+            last_signal_desc = "✅ ONNX Pullback (" + IntegerToString(onnx_feature_count) + " fitur) dimuat";
+            Print("OnInit: Model ONNX Reversal-Pullback berhasil dikonfigurasi dengan ", onnx_feature_count, " fitur input.");
            }
         }
      }
@@ -682,13 +750,17 @@ int OnInit()
    //--- Timer untuk refresh dashboard setiap 1 detik
    EventSetTimer(1);
    
+   //--- Reset state pullback contrarian
+   pb_state = PB_STATE_IDLE;
+   
    //--- Ambil level bulanan awal & update dashboard
    UpdateMonthlyLevels();
    UpdateDashboard();
    
-   Print("OnInit: EA XAUUSD REVERSAL v2.14 AKTIF | Symbol=", trade_symbol,
+   Print("OnInit: EA XAUUSD REVERSAL-PULLBACK v2.16 AKTIF | Symbol=", trade_symbol,
          " | Digits=", trade_digits, " | Point=", DoubleToString(trade_point, 8),
          " | MagicNumber=", InpMagicNumber,
+         " | Retest Timeout=", InpPullbackTimeoutSec, "s (2 Menit Contrarian)",
          " | Martingale=", (InpUseMartingale ? "ON" : "OFF"),
          " | ML=", (InpUseMLFilter ? "ON" : "OFF"));
    return(INIT_SUCCEEDED);
@@ -718,7 +790,7 @@ void OnDeinit(const int reason)
       handle_onnx = INVALID_HANDLE;
      }
    
-   Print("OnDeinit: EA REVERSAL dihentikan, reason=", reason);
+   Print("OnDeinit: EA REVERSAL-PULLBACK dihentikan, reason=", reason);
   }
 
 //+------------------------------------------------------------------+
@@ -753,8 +825,11 @@ void OnTick()
    //--- Hitung level candle monthly
    UpdateMonthlyLevels();
    
-   //--- Deteksi sinyal entry (loop/graph engine pada bar baru)
+   //--- Deteksi sinyal entry contrarian (dijalankan saat bar baru terbentuk)
    CheckForSignal();
+   
+   //--- State Machine: Pantau konfirmasi retest / pullback setiap tick
+   ProcessPullbackStateMachine();
    
    //--- Manajemen posisi (trailing / break-even jika di-extend)
    ManagePositions();
@@ -914,6 +989,13 @@ void CheckForSignal()
    if(bar_time == last_bar_time) return;
    last_bar_time = bar_time;
    
+   //--- Jika ada pending retest contrarian dari bar sebelumnya, otomatis batalkan
+   if(pb_state != PB_STATE_IDLE)
+     {
+      if(InpDebugLog) Print("CONTRARIAN RESET: Bar M15 baru terbentuk. Pending sinyal contrarian lama dibatalkan.");
+      pb_state = PB_STATE_IDLE;
+     }
+   
    //--- Ambil harga & indikator dari Bar 1 (bar yang sudah terkonfirmasi resmi)
    double close1      = iClose(trade_symbol, _Period, 1);
    double ema1        = ema_value[1];
@@ -1046,7 +1128,7 @@ void CheckForSignal()
      }
    
    //=================================================================
-   //=== NODE 4: Keputusan akhir masuk posisi                      ===
+   //=== NODE 4: Penjadwalan Masuk Posisi (Pullback Contrarian vs Instant) ===
    //=================================================================
    if(!do_buy && !do_sell) return; // tidak ada sinyal
    
@@ -1058,9 +1140,141 @@ void CheckForSignal()
       return;
      }
    
-   //--- Eksekusi order
-   if(do_buy && InpIsBuyAllowed)   OpenPosition(ORDER_TYPE_BUY);
-   if(do_sell && InpIsSellAllowed) OpenPosition(ORDER_TYPE_SELL);
+   //--- Jika mode Pullback dinonaktifkan, langsung eksekusi instan di harga market
+   if(!InpUsePullback)
+     {
+      if(do_buy && InpIsBuyAllowed)   OpenPosition(ORDER_TYPE_BUY);
+      if(do_sell && InpIsSellAllowed) OpenPosition(ORDER_TYPE_SELL);
+      return;
+     }
+
+   //--- MODE PULLBACK CONTRARIAN AKTIF: Hitung batas jarak diskon & batas cancel
+   //    Berbeda dengan PullBack EA biasa:
+   //    - Contrarian BUY: menunggu pasar naik dulu (konfirmasi pembalikan)
+   //    - Contrarian SELL: menunggu pasar turun dulu (konfirmasi pembalikan)
+   double cur_atr = (ArraySize(atr_value) > 1 && atr_value[1] > 0) ? atr_value[1] : (trade_point * 100.0);
+   double discount_dist = 0.0;
+   double cancel_dist   = 0.0;
+
+   if(InpPullbackDistMode == PULLBACK_DIST_ATR)
+     {
+      discount_dist = cur_atr * InpPullbackATR_Mult;
+      cancel_dist   = cur_atr * InpCancelATR_Mult;
+     }
+   else
+     {
+      discount_dist = InpPullbackFixedPts * trade_point;
+      cancel_dist   = InpCancelFixedPts * trade_point;
+     }
+
+   //--- Contrarian BUY: Harga sedang bearish/overbought, kita ingin beli saat ada bounce
+   //    Tunggu harga NAIK ke target (konfirmasi pembalikan bearish -> bullish)
+   //    Batal jika harga terus TURUN melampaui batas cancel (trennya benar-benar bearish)
+   if(do_buy && InpIsBuyAllowed)
+     {
+      pb_state        = PB_STATE_PENDING_BUY;
+      pb_signal_time  = TimeCurrent();
+      pb_ref_price    = SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+      pb_target_price = NormalizeDouble(pb_ref_price + discount_dist, trade_digits); // Konfirmasi naik dulu
+      pb_cancel_price = NormalizeDouble(pb_ref_price - cancel_dist, trade_digits);   // Batal jika terus dump
+      last_signal_desc = "CONTRARIAN BUY (Tunggu Bounce Naik >= " + DoubleToString(pb_target_price, trade_digits) + " dalam " + IntegerToString(InpPullbackTimeoutSec) + "s)";
+      if(InpDebugLog)
+         Print("CONTRARIAN PULLBACK ARMED [BUY]: Ref=", DoubleToString(pb_ref_price, trade_digits),
+               " | Bounce Target>=", DoubleToString(pb_target_price, trade_digits),
+               " | Cancel Boundary<=", DoubleToString(pb_cancel_price, trade_digits),
+               " | Timeout=", InpPullbackTimeoutSec, "s");
+     }
+   else if(do_sell && InpIsSellAllowed)
+     {
+      pb_state        = PB_STATE_PENDING_SELL;
+      pb_signal_time  = TimeCurrent();
+      pb_ref_price    = SymbolInfoDouble(trade_symbol, SYMBOL_BID);
+      pb_target_price = NormalizeDouble(pb_ref_price - discount_dist, trade_digits); // Konfirmasi turun dulu
+      pb_cancel_price = NormalizeDouble(pb_ref_price + cancel_dist, trade_digits);   // Batal jika terus rally
+      last_signal_desc = "CONTRARIAN SELL (Tunggu Pullback Turun <= " + DoubleToString(pb_target_price, trade_digits) + " dalam " + IntegerToString(InpPullbackTimeoutSec) + "s)";
+      if(InpDebugLog)
+         Print("CONTRARIAN PULLBACK ARMED [SELL]: Ref=", DoubleToString(pb_ref_price, trade_digits),
+               " | Pullback Target<=", DoubleToString(pb_target_price, trade_digits),
+               " | Cancel Boundary>=", DoubleToString(pb_cancel_price, trade_digits),
+               " | Timeout=", InpPullbackTimeoutSec, "s");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| State Machine PullBack Contrarian: Dieksekusi setiap tick        |
+//| Contrarian BUY: Menunggu harga NAIK (konfirmasi pembalikan)      |
+//| Contrarian SELL: Menunggu harga TURUN (konfirmasi pembalikan)    |
+//| Dibatalkan jika: timeout 2M | harga lari berlawanan (anti-FOMO)  |
+//+------------------------------------------------------------------+
+void ProcessPullbackStateMachine()
+  {
+   if(!InpUsePullback || pb_state == PB_STATE_IDLE) return;
+   
+   // 1. Validasi batas open posisi
+   if(CountOpenPositions() >= InpMaxOpenPositions)
+     {
+      pb_state = PB_STATE_IDLE;
+      return;
+     }
+     
+   int elapsed = (int)(TimeCurrent() - pb_signal_time);
+   
+   // 2. Cek Timeout (default 120 detik / 2 menit pertama candle)
+   if(elapsed > InpPullbackTimeoutSec)
+     {
+      last_signal_desc = "Sinyal Contrarian Hangus (Waktu Habis " + IntegerToString(elapsed) + "s > " + IntegerToString(InpPullbackTimeoutSec) + "s)";
+      if(InpDebugLog) Print("CONTRARIAN TIMEOUT: Batas 2 menit habis tanpa konfirmasi bounce. Sinyal dibatalkan.");
+      pb_state = PB_STATE_IDLE;
+      return;
+     }
+     
+   // 3. Evaluasi State BUY Contrarian (Menunggu harga naik sebagai konfirmasi bounce)
+   if(pb_state == PB_STATE_PENDING_BUY)
+     {
+      double bid = SymbolInfoDouble(trade_symbol, SYMBOL_BID);
+      double ask = SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+      
+      // Cancel: harga terus turun melampaui batas (trend masih kuat bearish - anti-FOMO)
+      if(bid <= pb_cancel_price)
+        {
+         last_signal_desc = "Contrarian BUY Batal: Harga Terus Turun (" + DoubleToString(bid, trade_digits) + " <= " + DoubleToString(pb_cancel_price, trade_digits) + ")";
+         if(InpDebugLog) Print("CONTRARIAN CANCEL [BUY]: Harga =", DoubleToString(bid, trade_digits), " melintasi cancel boundary. FOMO guard aktif.");
+         pb_state = PB_STATE_IDLE;
+         return;
+        }
+      
+      // Trigger: harga naik mencapai target bounce (konfirmasi pembalikan terkonfirmasi)
+      if(ask >= pb_target_price)
+        {
+         if(InpDebugLog) Print("CONTRARIAN TRIGGER [BUY]: Bounce naik ke ", DoubleToString(ask, trade_digits), " >= target ", DoubleToString(pb_target_price, trade_digits), ". Eksekusi BUY.");
+         pb_state = PB_STATE_IDLE;
+         OpenPosition(ORDER_TYPE_BUY);
+        }
+     }
+   
+   // 4. Evaluasi State SELL Contrarian (Menunggu harga turun sebagai konfirmasi pullback)
+   else if(pb_state == PB_STATE_PENDING_SELL)
+     {
+      double bid = SymbolInfoDouble(trade_symbol, SYMBOL_BID);
+      double ask = SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+      
+      // Cancel: harga terus naik melampaui batas (trend masih kuat bullish - anti-FOMO)
+      if(ask >= pb_cancel_price)
+        {
+         last_signal_desc = "Contrarian SELL Batal: Harga Terus Naik (" + DoubleToString(ask, trade_digits) + " >= " + DoubleToString(pb_cancel_price, trade_digits) + ")";
+         if(InpDebugLog) Print("CONTRARIAN CANCEL [SELL]: Harga =", DoubleToString(ask, trade_digits), " melintasi cancel boundary. FOMO guard aktif.");
+         pb_state = PB_STATE_IDLE;
+         return;
+        }
+      
+      // Trigger: harga turun mencapai target pullback (konfirmasi pembalikan terkonfirmasi)
+      if(bid <= pb_target_price)
+        {
+         if(InpDebugLog) Print("CONTRARIAN TRIGGER [SELL]: Pullback turun ke ", DoubleToString(bid, trade_digits), " <= target ", DoubleToString(pb_target_price, trade_digits), ". Eksekusi SELL.");
+         pb_state = PB_STATE_IDLE;
+         OpenPosition(ORDER_TYPE_SELL);
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
