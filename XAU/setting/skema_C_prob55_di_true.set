@@ -1,0 +1,72 @@
+; ===== SYMBOL & BROKER SETTINGS =====
+InpCustomSymbol=
+; ===== INDICATOR: EMA (arah tren) =====
+InpEMA_Period=50
+InpEMA_Price=1
+InpEMA_Shift=0
+; ===== INDICATOR: ADX (kekuatan & arah tren) =====
+InpADX_Period=14
+InpADX_Strength=15
+InpADX_UseDI=true
+; ===== INDICATOR: RSI =====
+InpRSI_Period=14
+InpRSI_Overbought=65.0
+InpRSI_Oversold=35.0
+InpRSI_Price=1
+; ===== STRATEGI / MODE =====
+InpTradeMode=2
+InpIsBuyAllowed=true
+InpIsSellAllowed=true
+InpUsePinBar=true
+InpUseEngulfing=true
+InpMaxOpenPositions=1
+InpMagicNumber=20260906
+; ===== MACHINE LEARNING / ONNX (FASE 2) =====
+InpUseMLFilter=true
+InpMLMinWinProb=0.55
+; ===== MONEY MANAGEMENT =====
+InpLotMode=1
+InpRiskPercent=1.0
+InpFixedLot=0.01
+InpMaxRiskMargin=30.0
+; ===== MARTINGALE / AVERAGING RECOVERY =====
+InpUseMartingale=true
+InpMartiDistMode=1
+InpMartiATR_Mult=2.0
+InpMartingaleDistPts=400.0
+InpMartingaleMult=2.0
+InpMaxMartingaleStep=6
+InpMartingaleProfitPts=50.0
+InpUseBasketTrailing=true
+InpBasketTrailStartUSD=3.0
+InpBasketTrailLockUSD=1.5
+InpBasketTrailStepUSD=1.0
+InpBasketTrailMoveUSD=0.5
+; ===== TRAILING STOP (SINGLE POSITION) =====
+InpUseTrailing=false
+InpTrailingMode=0
+InpTrailingStartPts=250.0
+InpTrailingLockPts=125.0
+InpTrailingStepPoints=100.0
+InpTrailingMovePoints=50.0
+InpTrailingDistPts=125.0
+InpTrailingStepPts=10.0
+; ===== STOP LOSS & TAKE PROFIT =====
+InpSLMode=0
+InpSL_MoneyUSD=300.0
+InpATR_Period=14
+InpATR_SL_Mult=2.0
+InpSL_FixedPts=500.0
+InpSLBuffer=0.0
+InpTPMode=3
+InpTP_MoneyUSD=3.0
+InpTP_RR_Ratio=1.5
+InpTP_FixedPts=300.0
+InpMonthlyBuffer=0.0
+; ===== UTILITAS & FILTER =====
+InpMaxSpreadPts=0
+InpStartHour=0
+InpEndHour=0
+InpSlippagePts=30
+InpShowDashboard=true
+InpDebugLog=false
